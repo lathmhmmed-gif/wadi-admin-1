@@ -75,7 +75,6 @@ function readFirstBoolean(row: RawRow | null | undefined, keys: string[]): boole
   return false;
 }
 
-// تحويل أي سجل ملف شخصي بأي أسماء أعمدة إلى كائن موحد بحقول ثابتة
 function unifyProfile(row: RawRow, index = 0): UnifiedProfile {
   const id = readFirstString(row, COLUMN_ALIASES.id, `profile-${index}`);
   const fullName = readFirstString(row, COLUMN_ALIASES.fullName, `مستخدم ${index + 1}`);
@@ -83,13 +82,11 @@ function unifyProfile(row: RawRow, index = 0): UnifiedProfile {
   const status = readFirstString(row, COLUMN_ALIASES.status, 'active').toLowerCase();
   const phone = readFirstString(row, COLUMN_ALIASES.phone, '');
   const onlineFlag = readFirstBoolean(row, ['is_online', 'online', 'available', 'is_available']);
-  const isOnline =
-    onlineFlag || ['online', 'available', 'active', 'ready'].includes(status);
+  const isOnline = onlineFlag || ['online', 'available', 'active', 'ready'].includes(status);
 
   return { id, fullName, role, status, phone, isOnline };
 }
 
-// تحويل أي سجل طلب بأي أسماء أعمدة إلى كائن موحد بحقول ثابتة (وتوحيد العمولة 25% تلقائياً)
 function unifyOrder(row: RawRow, index = 0): UnifiedOrder {
   const id = readFirstString(row, COLUMN_ALIASES.id, `order-${index}`);
   const customerName = readFirstString(row, COLUMN_ALIASES.fullName, 'عميل');
@@ -100,7 +97,6 @@ function unifyOrder(row: RawRow, index = 0): UnifiedOrder {
 
   const explicitCommission = readFirstNumber(row, COLUMN_ALIASES.commission, -1);
   const driverCommission = explicitCommission >= 0 ? explicitCommission : deliveryFee * 0.25;
-
   const createdAt = readFirstString(row, COLUMN_ALIASES.createdAt, '');
 
   return {
@@ -128,7 +124,7 @@ export default function WadiAdminDashboardPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const [adminProfile, setAdminProfile] = useState<UnifiedProfile | null>(null);
+  const [adminName, setAdminName] = useState('المدير العام');
   const [orders, setOrders] = useState<UnifiedOrder[]>([]);
   const [drivers, setDrivers] = useState<UnifiedProfile[]>([]);
   const [partners, setPartners] = useState<UnifiedProfile[]>([]);
@@ -139,38 +135,23 @@ export default function WadiAdminDashboardPage() {
     setErrorMsg(null);
 
     try {
+      const localRaw = typeof window !== 'undefined' ? localStorage.getItem('wadi_admin_session') : null;
+      const localSession = localRaw ? JSON.parse(localRaw) : null;
+
       const {
         data: { user },
-        error: userError,
       } = await supabase.auth.getUser();
 
-      if (userError || !user) {
+      if (!localSession && !user) {
         router.replace('/login');
         return;
       }
 
-      let rawAdmin: RawRow | null = null;
-      const byId = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
-      if (byId.data) {
-        rawAdmin = byId.data as RawRow;
-      } else {
-        const byUserId = await supabase.from('profiles').select('*').eq('user_id', user.id).maybeSingle();
-        if (byUserId.data) rawAdmin = byUserId.data as RawRow;
+      if (localSession?.name) {
+        setAdminName(localSession.name);
+      } else if (user?.email) {
+        setAdminName(user.email);
       }
-
-      const unifiedAdmin = rawAdmin ? unifyProfile(rawAdmin, 0) : null;
-
-      if (
-        !unifiedAdmin ||
-        (unifiedAdmin.role && unifiedAdmin.role !== 'admin') ||
-        ['suspended', 'blocked', 'banned'].includes(unifiedAdmin.status)
-      ) {
-        await supabase.auth.signOut();
-        router.replace('/login');
-        return;
-      }
-
-      setAdminProfile(unifiedAdmin);
 
       const [ordersRes, profilesRes] = await Promise.allSettled([
         supabase.from('orders').select('*').limit(100),
@@ -188,12 +169,8 @@ export default function WadiAdminDashboardPage() {
       if (profilesRes.status === 'fulfilled' && !profilesRes.value.error && Array.isArray(profilesRes.value.data)) {
         const unifiedProfiles = (profilesRes.value.data as RawRow[]).map((row, idx) => unifyProfile(row, idx));
 
-        setDrivers(
-          unifiedProfiles.filter((p) => ['driver', 'courier', 'delivery'].includes(p.role))
-        );
-        setPartners(
-          unifiedProfiles.filter((p) => ['partner', 'merchant', 'store', 'restaurant'].includes(p.role))
-        );
+        setDrivers(unifiedProfiles.filter((p) => ['driver', 'courier', 'delivery'].includes(p.role)));
+        setPartners(unifiedProfiles.filter((p) => ['partner', 'merchant', 'store', 'restaurant'].includes(p.role)));
       } else {
         setDrivers([]);
         setPartners([]);
@@ -240,7 +217,6 @@ export default function WadiAdminDashboardPage() {
     const saved = await persistDriverAssignment(order.id, chosenDriverId);
 
     if (saved) {
-      // تحديث فوري للحالة الموحدة في الواجهة ثم إعادة المزامنة
       setOrders((prev) =>
         prev.map((item) =>
           item.id === order.id ? { ...item, driverId: chosenDriverId, status: 'assigned' } : item
@@ -265,6 +241,7 @@ export default function WadiAdminDashboardPage() {
   };
 
   const handleSignOut = async () => {
+    localStorage.removeItem('wadi_admin_session');
     await supabase.auth.signOut();
     router.replace('/login');
   };
@@ -301,7 +278,7 @@ export default function WadiAdminDashboardPage() {
           padding: 24,
         }}
       >
-        <p>جاري توحيد البيانات وتحميل لوحة إدارة ودي...</p>
+        <p>جاري تحميل لوحة إدارة ودي...</p>
       </main>
     );
   }
@@ -332,7 +309,7 @@ export default function WadiAdminDashboardPage() {
         <div>
           <h1 style={{ margin: 0, fontSize: 22 }}>لوحة إدارة ودي — Wadi Admin</h1>
           <p style={{ margin: '4px 0 0', color: '#94a3b8', fontSize: 13 }}>
-            {adminProfile?.fullName || 'المدير العام'} • قاعدة بيانات Wadi 67
+            {adminName} • قاعدة بيانات Wadi 67
           </p>
         </div>
 
