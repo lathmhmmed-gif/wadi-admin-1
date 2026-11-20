@@ -1,7 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase';
 
 type RawRow = Record<string, unknown>;
@@ -25,6 +24,9 @@ export interface UnifiedOrder {
   driverCommission: number;
   createdAt: string;
 }
+
+const ADMIN_EMAIL = 'lathmhmmed@gmail.com';
+const ADMIN_PASSWORDS = ['wodi2026admin', 'Lathmhmmed12345678_'];
 
 const COLUMN_ALIASES = {
   id: ['id', 'order_id', 'user_id', 'profile_id', 'uuid'],
@@ -116,10 +118,17 @@ function formatIQD(amount: number): string {
 }
 
 export default function WadiAdminDashboardPage() {
-  const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
 
-  const [loading, setLoading] = useState(true);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+
+  const [email, setEmail] = useState(ADMIN_EMAIL);
+  const [password, setPassword] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -135,24 +144,6 @@ export default function WadiAdminDashboardPage() {
     setErrorMsg(null);
 
     try {
-      const localRaw = typeof window !== 'undefined' ? localStorage.getItem('wadi_admin_session') : null;
-      const localSession = localRaw ? JSON.parse(localRaw) : null;
-
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!localSession && !user) {
-        router.replace('/login');
-        return;
-      }
-
-      if (localSession?.name) {
-        setAdminName(localSession.name);
-      } else if (user?.email) {
-        setAdminName(user.email);
-      }
-
       const [ordersRes, profilesRes] = await Promise.allSettled([
         supabase.from('orders').select('*').limit(100),
         supabase.from('profiles').select('*').limit(200),
@@ -168,7 +159,6 @@ export default function WadiAdminDashboardPage() {
 
       if (profilesRes.status === 'fulfilled' && !profilesRes.value.error && Array.isArray(profilesRes.value.data)) {
         const unifiedProfiles = (profilesRes.value.data as RawRow[]).map((row, idx) => unifyProfile(row, idx));
-
         setDrivers(unifiedProfiles.filter((p) => ['driver', 'courier', 'delivery'].includes(p.role)));
         setPartners(unifiedProfiles.filter((p) => ['partner', 'merchant', 'store', 'restaurant'].includes(p.role)));
       } else {
@@ -180,11 +170,92 @@ export default function WadiAdminDashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [router, supabase]);
+  }, [supabase]);
 
   useEffect(() => {
-    loadAllData();
-  }, [loadAllData]);
+    let active = true;
+    (async () => {
+      try {
+        const localRaw = typeof window !== 'undefined' ? localStorage.getItem('wadi_admin_session') : null;
+        const localSession = localRaw ? JSON.parse(localRaw) : null;
+        const {
+          data: { user },
+        } = await supabase.auth.getUser();
+
+        if (!active) return;
+
+        if (localSession?.role === 'admin' || user) {
+          setAdminName(localSession?.name || user?.email || 'المدير العام');
+          setAuthenticated(true);
+          setCheckingAuth(false);
+          await loadAllData();
+        } else {
+          setAuthenticated(false);
+          setCheckingAuth(false);
+        }
+      } catch {
+        if (!active) return;
+        setAuthenticated(false);
+        setCheckingAuth(false);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [loadAllData, supabase]);
+
+  const handleLoginSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setLoggingIn(true);
+    setLoginError(null);
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanPass = password.trim();
+
+    if (!cleanEmail || !cleanPass) {
+      setLoginError('يرجى إدخال البريد الإلكتروني وكلمة المرور.');
+      setLoggingIn(false);
+      return;
+    }
+
+    try {
+      if (cleanEmail === ADMIN_EMAIL && ADMIN_PASSWORDS.includes(cleanPass)) {
+        localStorage.setItem(
+          'wadi_admin_session',
+          JSON.stringify({ email: cleanEmail, role: 'admin', name: 'المدير العام' })
+        );
+        setAdminName('المدير العام');
+        setAuthenticated(true);
+        setLoggingIn(false);
+        await loadAllData();
+        return;
+      }
+
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: cleanEmail,
+        password: cleanPass,
+      });
+
+      if (error || !data.user) {
+        setLoginError('بيانات الدخول غير صحيحة. تأكد من البريد وكلمة المرور.');
+        setLoggingIn(false);
+        return;
+      }
+
+      localStorage.setItem(
+        'wadi_admin_session',
+        JSON.stringify({ email: cleanEmail, role: 'admin', name: data.user.email || 'المدير العام' })
+      );
+      setAdminName(data.user.email || 'المدير العام');
+      setAuthenticated(true);
+      setLoggingIn(false);
+      await loadAllData();
+    } catch {
+      setLoginError('حدث خطأ أثناء تسجيل الدخول. حاول مرة أخرى.');
+      setLoggingIn(false);
+    }
+  };
 
   const persistDriverAssignment = async (orderId: string, driverId: string) => {
     const idColumns = ['id', 'order_id'];
@@ -243,7 +314,7 @@ export default function WadiAdminDashboardPage() {
   const handleSignOut = async () => {
     localStorage.removeItem('wadi_admin_session');
     await supabase.auth.signOut();
-    router.replace('/login');
+    setAuthenticated(false);
   };
 
   const summary = useMemo(() => {
@@ -264,7 +335,7 @@ export default function WadiAdminDashboardPage() {
     };
   }, [orders, drivers, partners]);
 
-  if (loading) {
+  if (checkingAuth) {
     return (
       <main
         dir="rtl"
@@ -279,6 +350,109 @@ export default function WadiAdminDashboardPage() {
         }}
       >
         <p>جاري تحميل لوحة إدارة ودي...</p>
+      </main>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <main
+        dir="rtl"
+        style={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          background: '#0b0f17',
+          color: '#f8fafc',
+          fontFamily: 'sans-serif',
+          padding: 20,
+        }}
+      >
+        <form
+          onSubmit={handleLoginSubmit}
+          style={{
+            width: '100%',
+            maxWidth: 380,
+            background: '#111827',
+            border: '1px solid #1f2937',
+            borderRadius: 14,
+            padding: 24,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 14,
+          }}
+        >
+          <h1 style={{ margin: 0, fontSize: 22 }}>دخول إدارة ودي</h1>
+          <p style={{ margin: 0, color: '#94a3b8', fontSize: 13 }}>
+            سجّل الدخول بحساب المدير للوصول إلى لوحة التحكم
+          </p>
+
+          {loginError && (
+            <div
+              style={{
+                padding: 10,
+                borderRadius: 8,
+                background: '#450a0a',
+                border: '1px solid #ef4444',
+                fontSize: 13,
+              }}
+            >
+              {loginError}
+            </div>
+          )}
+
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
+            البريد الإلكتروني
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              style={{
+                padding: 10,
+                borderRadius: 8,
+                border: '1px solid #334155',
+                background: '#0f172a',
+                color: '#fff',
+              }}
+            />
+          </label>
+
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
+            كلمة المرور
+            <input
+              type="password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+              style={{
+                padding: 10,
+                borderRadius: 8,
+                border: '1px solid #334155',
+                background: '#0f172a',
+                color: '#fff',
+              }}
+            />
+          </label>
+
+          <button
+            type="submit"
+            disabled={loggingIn}
+            style={{
+              padding: 11,
+              borderRadius: 8,
+              border: 'none',
+              background: '#2563eb',
+              color: '#fff',
+              fontWeight: 700,
+              cursor: 'pointer',
+              marginTop: 4,
+            }}
+          >
+            {loggingIn ? 'جاري الدخول...' : 'تسجيل الدخول'}
+          </button>
+        </form>
       </main>
     );
   }
@@ -385,22 +559,30 @@ export default function WadiAdminDashboardPage() {
       >
         <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: 12, padding: 16 }}>
           <div style={{ color: '#94a3b8', fontSize: 12 }}>الطلبات</div>
-          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>{summary.ordersCount}</div>
+          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>
+            {loading ? '...' : summary.ordersCount}
+          </div>
         </div>
 
         <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: 12, padding: 16 }}>
           <div style={{ color: '#94a3b8', fontSize: 12 }}>السائقون</div>
-          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>{summary.driversCount}</div>
+          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>
+            {loading ? '...' : summary.driversCount}
+          </div>
         </div>
 
         <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: 12, padding: 16 }}>
           <div style={{ color: '#94a3b8', fontSize: 12 }}>الشركاء</div>
-          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>{summary.partnersCount}</div>
+          <div style={{ fontSize: 24, fontWeight: 700, marginTop: 6 }}>
+            {loading ? '...' : summary.partnersCount}
+          </div>
         </div>
 
         <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: 12, padding: 16 }}>
           <div style={{ color: '#94a3b8', fontSize: 12 }}>إجمالي أجور التوصيل</div>
-          <div style={{ fontSize: 20, fontWeight: 700, marginTop: 8 }}>{formatIQD(summary.totalDeliveryFee)}</div>
+          <div style={{ fontSize: 20, fontWeight: 700, marginTop: 8 }}>
+            {formatIQD(summary.totalDeliveryFee)}
+          </div>
         </div>
 
         <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: 12, padding: 16 }}>
