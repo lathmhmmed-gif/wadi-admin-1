@@ -33,6 +33,7 @@ export interface DeliveryZonePrice {
 
 export interface UnifiedProfile {
   id: string;
+  sourceTable: 'partners' | 'profiles';
   fullName: string;
   username: string;
   role: string;
@@ -82,15 +83,34 @@ const SETTINGS_KEY = 'wadi_admin_settings_v1';
 const ZONES_STORAGE_KEY = 'wadi_delivery_zones_v1';
 
 const COLUMN_ALIASES = {
-  id: ['id', 'order_id', 'user_id', 'profile_id', 'uuid'],
-  fullName: ['full_name', 'name', 'customer_name', 'client_name', 'recipient_name', 'store_name', 'merchant_name'],
+  id: ['id', 'order_id', 'user_id', 'profile_id', 'partner_id', 'uuid'],
+  fullName: [
+    'business_name',
+    'project_name',
+    'full_name',
+    'name',
+    'customer_name',
+    'client_name',
+    'recipient_name',
+    'store_name',
+    'merchant_name',
+  ],
   username: ['username', 'user_name', 'handle', 'login', 'email'],
-  partnerName: ['partner_name', 'merchant_name', 'store_name', 'restaurant_name', 'shop_name', 'vendor_name'],
+  partnerName: [
+    'business_name',
+    'project_name',
+    'partner_name',
+    'merchant_name',
+    'store_name',
+    'restaurant_name',
+    'shop_name',
+    'vendor_name',
+  ],
   role: ['role', 'user_role', 'account_type', 'type'],
-  category: ['category', 'business_type', 'store_type', 'partner_type', 'sector', 'specialty'],
+  category: ['category', 'business_type', 'store_type', 'partner_type', 'sector', 'specialty', 'section'],
   status: ['status', 'order_status', 'account_status', 'driver_status', 'state'],
   phone: ['phone', 'mobile', 'phone_number', 'tel', 'whatsapp'],
-  address: ['address', 'area', 'district', 'city', 'region', 'location'],
+  address: ['address', 'area', 'district', 'city', 'region', 'location', 'customer_zone'],
   avatar: ['avatar_url', 'photo_url', 'image_url', 'profile_image', 'picture', 'photo', 'avatar'],
   driverId: ['driver_id', 'courier_id', 'delivery_id', 'assigned_driver_id'],
   deliveryFee: ['delivery_fee', 'delivery_price', 'shipping_fee', 'fee', 'delivery_cost', 'total_delivery'],
@@ -149,16 +169,33 @@ function readFirstBoolean(row: RawRow | null | undefined, keys: string[]): boole
   return null;
 }
 
+function isDriverAccount(rawRole: string, rawCategory: string): boolean {
+  const combined = `${rawRole} ${rawCategory}`.toLowerCase();
+  return (
+    combined.includes('driver') ||
+    combined.includes('courier') ||
+    combined.includes('delivery') ||
+    combined.includes('مندوب') ||
+    combined.includes('سائق') ||
+    combined.includes('توصيل')
+  );
+}
+
 function detectPartnerCategory(rawCategory: string, name: string): PartnerCategory {
   const combined = `${rawCategory} ${name}`.toLowerCase();
   if (
     combined.includes('مطعم') ||
+    combined.includes('مطاعم') ||
     combined.includes('restaurant') ||
+    combined.includes('restaurants') ||
     combined.includes('food') ||
     combined.includes('cafe') ||
     combined.includes('كافيه') ||
     combined.includes('برغر') ||
-    combined.includes('بيتزا')
+    combined.includes('بيتزا') ||
+    combined.includes('شاورما') ||
+    combined.includes('مشاوي') ||
+    combined.includes('معجنات')
   ) {
     return 'restaurants';
   }
@@ -168,14 +205,19 @@ function detectPartnerCategory(rawCategory: string, name: string): PartnerCatego
     combined.includes('سوبر') ||
     combined.includes('ماركت') ||
     combined.includes('market') ||
-    combined.includes('grocery')
+    combined.includes('markets') ||
+    combined.includes('grocery') ||
+    combined.includes('بقالة')
   ) {
     return 'markets';
   }
   if (
     combined.includes('بيج') ||
+    combined.includes('بيجات') ||
     combined.includes('page') ||
+    combined.includes('pages') ||
     combined.includes('انستا') ||
+    combined.includes('تيك') ||
     combined.includes('social') ||
     combined.includes('online')
   ) {
@@ -184,12 +226,21 @@ function detectPartnerCategory(rawCategory: string, name: string): PartnerCatego
   return 'stores';
 }
 
-function unifyProfile(row: RawRow, index = 0): UnifiedProfile {
-  const id = readFirstString(row, COLUMN_ALIASES.id, `profile-${index}`);
+function unifyProfile(
+  row: RawRow,
+  index = 0,
+  sourceTable: 'partners' | 'profiles' = 'profiles'
+): UnifiedProfile {
+  const id = readFirstString(row, COLUMN_ALIASES.id, `${sourceTable}-${index}`);
   const fullName = readFirstString(row, COLUMN_ALIASES.fullName, `حساب ${index + 1}`);
   const username = readFirstString(row, COLUMN_ALIASES.username, `@user_${id.slice(0, 5)}`);
-  const role = readFirstString(row, COLUMN_ALIASES.role, 'partner').toLowerCase();
+  const rawRole = readFirstString(
+    row,
+    COLUMN_ALIASES.role,
+    sourceTable === 'partners' ? 'partner' : 'partner'
+  ).toLowerCase();
   const rawCat = readFirstString(row, COLUMN_ALIASES.category, '');
+  const role = isDriverAccount(rawRole, rawCat) ? 'driver' : rawRole || 'partner';
   const partnerCategory = detectPartnerCategory(rawCat, fullName);
   const status = readFirstString(row, COLUMN_ALIASES.status, 'pending').toLowerCase();
   const phone = readFirstString(row, COLUMN_ALIASES.phone, '');
@@ -211,6 +262,7 @@ function unifyProfile(row: RawRow, index = 0): UnifiedProfile {
 
   return {
     id,
+    sourceTable,
     fullName,
     username,
     role,
@@ -445,9 +497,10 @@ export default function WadiAdminEnterpriseDashboard() {
       setErrorMsg(null);
 
       try {
-        const [ordersRes, profilesRes, zonesRes] = await Promise.allSettled([
+        const [ordersRes, profilesRes, partnersRes, zonesRes] = await Promise.allSettled([
           supabase.from('orders').select('*').limit(250),
           supabase.from('profiles').select('*').limit(400),
+          supabase.from('partners').select('*').limit(400),
           supabase.from('delivery_zones').select('*').limit(300),
         ]);
 
@@ -488,14 +541,38 @@ export default function WadiAdminEnterpriseDashboard() {
           setOrders([]);
         }
 
-        if (profilesRes.status === 'fulfilled' && !profilesRes.value.error && Array.isArray(profilesRes.value.data)) {
-          const unifiedProfiles = (profilesRes.value.data as RawRow[]).map((row, idx) => unifyProfile(row, idx));
-          setDrivers(unifiedProfiles.filter((p) => ['driver', 'courier', 'delivery'].includes(p.role)));
-          setPartners(unifiedProfiles.filter((p) => ['partner', 'merchant', 'store', 'restaurant'].includes(p.role)));
-        } else {
-          setDrivers([]);
-          setPartners([]);
+        const mergedDrivers: UnifiedProfile[] = [];
+        const mergedPartners: UnifiedProfile[] = [];
+        const seenDriverKeys = new Set<string>();
+        const seenPartnerKeys = new Set<string>();
+
+        const pushUnifiedAccount = (acc: UnifiedProfile) => {
+          const dedupeKey = `${acc.id}::${acc.fullName.toLowerCase()}::${acc.username.toLowerCase()}`;
+          if (acc.role === 'driver') {
+            if (!seenDriverKeys.has(dedupeKey)) {
+              seenDriverKeys.add(dedupeKey);
+              mergedDrivers.push(acc);
+            }
+          } else if (!seenPartnerKeys.has(dedupeKey)) {
+            seenPartnerKeys.add(dedupeKey);
+            mergedPartners.push(acc);
+          }
+        };
+
+        if (partnersRes.status === 'fulfilled' && !partnersRes.value.error && Array.isArray(partnersRes.value.data)) {
+          (partnersRes.value.data as RawRow[]).forEach((row, idx) => {
+            pushUnifiedAccount(unifyProfile(row, idx, 'partners'));
+          });
         }
+
+        if (profilesRes.status === 'fulfilled' && !profilesRes.value.error && Array.isArray(profilesRes.value.data)) {
+          (profilesRes.value.data as RawRow[]).forEach((row, idx) => {
+            pushUnifiedAccount(unifyProfile(row, idx, 'profiles'));
+          });
+        }
+
+        setDrivers(mergedDrivers);
+        setPartners(mergedPartners);
       } catch {
         setErrorMsg('تعذر تحميل بيانات لوحة ودي. تحقق من الاتصال بقاعدة البيانات.');
       } finally {
@@ -867,7 +944,9 @@ export default function WadiAdminEnterpriseDashboard() {
     setNotice(null);
     setErrorMsg(null);
 
-    const idCols = ['id', 'user_id', 'profile_id'];
+    const tablesToTry: ('partners' | 'profiles')[] =
+      profile.sourceTable === 'partners' ? ['partners', 'profiles'] : ['profiles', 'partners'];
+    const idCols = ['id', 'user_id', 'profile_id', 'partner_id'];
     const payloads: RawRow[] = nextApproved
       ? [
           { is_approved: true, status: 'active' },
@@ -883,13 +962,16 @@ export default function WadiAdminEnterpriseDashboard() {
         ];
 
     let saved = false;
-    for (const col of idCols) {
-      for (const body of payloads) {
-        const res = await supabase.from('profiles').update(body).eq(col, profile.id).select();
-        if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
-          saved = true;
-          break;
+    for (const tableName of tablesToTry) {
+      for (const col of idCols) {
+        for (const body of payloads) {
+          const res = await supabase.from(tableName).update(body).eq(col, profile.id).select();
+          if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
+            saved = true;
+            break;
+          }
         }
+        if (saved) break;
       }
       if (saved) break;
     }
@@ -902,7 +984,7 @@ export default function WadiAdminEnterpriseDashboard() {
       );
       await loadAllData(false);
     } else {
-      setErrorMsg('تعذر تعديل حالة الحساب في Supabase؛ تأكد من سياسات RLS لجدول profiles.');
+      setErrorMsg('تعذر تعديل حالة الحساب في Supabase؛ تأكد من سياسات RLS.');
     }
     setBusyId(null);
   };
@@ -912,14 +994,20 @@ export default function WadiAdminEnterpriseDashboard() {
     setNotice(null);
     setErrorMsg(null);
 
-    const idCols = ['id', 'user_id', 'profile_id'];
+    const tablesToTry: ('partners' | 'profiles')[] =
+      profile.sourceTable === 'partners' ? ['partners', 'profiles'] : ['profiles', 'partners'];
+    const idCols = ['id', 'user_id', 'profile_id', 'partner_id'];
     let deleted = false;
-    for (const col of idCols) {
-      const res = await supabase.from('profiles').delete().eq(col, profile.id).select();
-      if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
-        deleted = true;
-        break;
+
+    for (const tableName of tablesToTry) {
+      for (const col of idCols) {
+        const res = await supabase.from(tableName).delete().eq(col, profile.id).select();
+        if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
+          deleted = true;
+          break;
+        }
       }
+      if (deleted) break;
     }
 
     if (deleted) {
@@ -1230,7 +1318,7 @@ export default function WadiAdminEnterpriseDashboard() {
 
   const renderPartnerCard = (prt: UnifiedProfile) => (
     <div
-      key={prt.id}
+      key={`${prt.sourceTable}-${prt.id}`}
       style={{
         background: palette.card,
         border: `1px solid ${palette.border}`,
@@ -2354,7 +2442,7 @@ export default function WadiAdminEnterpriseDashboard() {
             ) : (
               pendingAccounts.map((acc) => (
                 <div
-                  key={acc.id}
+                  key={`${acc.sourceTable}-${acc.id}`}
                   style={{
                     background: palette.card,
                     border: '1px solid #92400e',
@@ -2377,7 +2465,7 @@ export default function WadiAdminEnterpriseDashboard() {
                       <div>
                         <strong>{acc.fullName}</strong>
                         <div style={{ fontSize: 12, color: palette.muted }}>
-                          النوع: {['driver', 'courier', 'delivery'].includes(acc.role) ? 'مندوب توصيل' : 'شريك تجاري'} • اليوزر: {acc.username}
+                          النوع: {acc.role === 'driver' ? 'مندوب توصيل' : 'شريك تجاري'} • اليوزر: {acc.username}
                         </div>
                       </div>
                     </div>
@@ -2487,7 +2575,7 @@ export default function WadiAdminEnterpriseDashboard() {
 
                   return (
                     <div
-                      key={drv.id}
+                      key={`${drv.sourceTable}-${drv.id}`}
                       style={{
                         background: palette.card,
                         border: `1px solid ${palette.border}`,
