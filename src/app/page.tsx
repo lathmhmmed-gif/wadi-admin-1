@@ -81,6 +81,7 @@ const SETTLEMENT_KEY = 'wadi_driver_settlement_v1';
 const SUB_ADMINS_KEY = 'wadi_sub_admins_v1';
 const SETTINGS_KEY = 'wadi_admin_settings_v1';
 const ZONES_STORAGE_KEY = 'wadi_delivery_zones_v1';
+const NOTIFIED_ORDERS_KEY = 'wadi_notified_order_ids_v1';
 
 const COLUMN_ALIASES = {
   id: ['id', 'order_id', 'user_id', 'profile_id', 'partner_id', 'uuid'],
@@ -334,7 +335,7 @@ function formatStatusLabel(status: string): string {
   return status || 'غير محدد';
 }
 
-function playNotificationTone(style: SoundStyle) {
+function playNotificationTone(style: SoundStyle, repeatCount = 1) {
   if (typeof window === 'undefined') return;
   try {
     const AudioCtx =
@@ -343,6 +344,10 @@ function playNotificationTone(style: SoundStyle) {
     if (!AudioCtx) return;
 
     const ctx = new AudioCtx();
+    if (ctx.state === 'suspended') {
+      void ctx.resume();
+    }
+
     const patterns: Record<SoundStyle, { freqs: number[]; type: OscillatorType; step: number }> = {
       siren: { freqs: [880, 1174.66, 880, 1318.51, 1567.98], type: 'sawtooth', step: 0.13 },
       chime: { freqs: [587.33, 880, 1174.66], type: 'sine', step: 0.18 },
@@ -351,22 +356,30 @@ function playNotificationTone(style: SoundStyle) {
     };
 
     const chosen = patterns[style] || patterns.siren;
-    chosen.freqs.forEach((freq, idx) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = chosen.type;
-      osc.frequency.setValueAtTime(freq, ctx.currentTime + idx * chosen.step);
+    const clampedRepeats = Math.max(1, Math.min(3, repeatCount));
+    let cursor = ctx.currentTime + 0.02;
 
-      gain.gain.setValueAtTime(0.001, ctx.currentTime + idx * chosen.step);
-      gain.gain.exponentialRampToValueAtTime(0.38, ctx.currentTime + idx * chosen.step + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + (idx + 1) * chosen.step);
+    for (let r = 0; r < clampedRepeats; r += 1) {
+      chosen.freqs.forEach((freq, idx) => {
+        const startAt = cursor + idx * chosen.step;
+        const endAt = startAt + chosen.step;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = chosen.type;
+        osc.frequency.setValueAtTime(freq, startAt);
 
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+        gain.gain.setValueAtTime(0.001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.45, startAt + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, endAt);
 
-      osc.start(ctx.currentTime + idx * chosen.step);
-      osc.stop(ctx.currentTime + (idx + 1) * chosen.step + 0.01);
-    });
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.start(startAt);
+        osc.stop(endAt + 0.01);
+      });
+      cursor += chosen.freqs.length * chosen.step + 0.14;
+    }
   } catch {
     // تجاهل قيود التشغيل التلقائي
   }
@@ -435,8 +448,17 @@ export default function WadiAdminEnterpriseDashboard() {
   const [themeBrightness, setThemeBrightness] = useState<ThemeBrightness>('dark');
   const [visualBannerAlerts, setVisualBannerAlerts] = useState(true);
 
-  const knownOrderIdsRef = useRef<Set<string>>(new Set());
-  const hasLoadedOnceRef = useRef<boolean>(false);
+  const notifiedOrderIdsRef = useRef<Set<string>>(new Set());
+  const hasSeededInitialOrdersRef = useRef<boolean>(false);
+
+  // إخفاء شريط الإشعار الأخضر تلقائياً بعد 4 ثوانٍ
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => {
+      setNotice(null);
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   // تحميل الإعدادات والمدراء وأسعار المناطق المحلية
   useEffect(() => {
@@ -450,6 +472,14 @@ export default function WadiAdminEnterpriseDashboard() {
 
       const savedZones = localStorage.getItem(ZONES_STORAGE_KEY);
       if (savedZones) setDeliveryZones(JSON.parse(savedZones));
+
+      const savedNotified = localStorage.getItem(NOTIFIED_ORDERS_KEY);
+      if (savedNotified) {
+        const arr = JSON.parse(savedNotified);
+        if (Array.isArray(arr)) {
+          notifiedOrderIdsRef.current = new Set(arr.map(String));
+        }
+      }
 
       const savedSettings = localStorage.getItem(SETTINGS_KEY);
       if (savedSettings) {
@@ -491,6 +521,20 @@ export default function WadiAdminEnterpriseDashboard() {
     [soundEnabled, soundStyle, themeBrightness, visualBannerAlerts]
   );
 
+  const triggerOrderAlert = useCallback(
+    (orderItem: UnifiedOrder) => {
+      if (soundEnabled) {
+        playNotificationTone(soundStyle, 2);
+      }
+      if (visualBannerAlerts) {
+        setNotice(
+          `طلب جديد من الشريك (${orderItem.partnerName}) — رقم #${orderItem.id.slice(0, 8)} (${formatIQD(orderItem.deliveryFee)})`
+        );
+      }
+    },
+    [soundEnabled, soundStyle, visualBannerAlerts]
+  );
+
   const loadAllData = useCallback(
     async (playSoundOnNew = false) => {
       setLoading(true);
@@ -524,18 +568,39 @@ export default function WadiAdminEnterpriseDashboard() {
           );
           unifiedOrders.sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0));
 
-          const currentIds = new Set(unifiedOrders.map((o) => o.id));
-          if (hasLoadedOnceRef.current && playSoundOnNew && soundEnabled) {
-            const newCount = unifiedOrders.filter((o) => !knownOrderIdsRef.current.has(o.id)).length;
-            if (newCount > 0) {
-              playNotificationTone(soundStyle);
+          if (!hasSeededInitialOrdersRef.current) {
+            unifiedOrders.forEach((o) => notifiedOrderIdsRef.current.add(o.id));
+            hasSeededInitialOrdersRef.current = true;
+            if (typeof window !== 'undefined') {
+              localStorage.setItem(
+                NOTIFIED_ORDERS_KEY,
+                JSON.stringify(Array.from(notifiedOrderIdsRef.current).slice(-500))
+              );
+            }
+          } else if (playSoundOnNew) {
+            const unnotifiedOrders = unifiedOrders.filter((o) => !notifiedOrderIdsRef.current.has(o.id));
+            if (unnotifiedOrders.length > 0) {
+              unnotifiedOrders.forEach((o) => notifiedOrderIdsRef.current.add(o.id));
+              if (typeof window !== 'undefined') {
+                localStorage.setItem(
+                  NOTIFIED_ORDERS_KEY,
+                  JSON.stringify(Array.from(notifiedOrderIdsRef.current).slice(-500))
+                );
+              }
+              const latestOrder = unnotifiedOrders[0];
+              if (soundEnabled) {
+                playNotificationTone(soundStyle, Math.min(3, unnotifiedOrders.length + 1));
+              }
               if (visualBannerAlerts) {
-                setNotice(`تنبيه: وصل (${newCount}) طلب جديد الآن!`);
+                setNotice(
+                  unnotifiedOrders.length === 1
+                    ? `طلب جديد من الشريك (${latestOrder.partnerName}) — رقم #${latestOrder.id.slice(0, 8)}`
+                    : `وصل (${unnotifiedOrders.length}) طلبات جديدة من الشركاء — أحدثها من (${latestOrder.partnerName})`
+                );
               }
             }
           }
-          knownOrderIdsRef.current = currentIds;
-          hasLoadedOnceRef.current = true;
+
           setOrders(unifiedOrders);
         } else {
           setOrders([]);
@@ -620,9 +685,32 @@ export default function WadiAdminEnterpriseDashboard() {
     if (!authenticated) return;
     const timer = setInterval(() => {
       void loadAllData(true);
-    }, 15000);
-    return () => clearInterval(timer);
-  }, [authenticated, loadAllData]);
+    }, 10000);
+
+    const channel = supabase
+      .channel('wadi-admin-orders-realtime')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, (payload) => {
+        const insertedRow = (payload.new || {}) as RawRow;
+        const unified = unifyOrder(insertedRow, 0, deliveryZones);
+        if (!notifiedOrderIdsRef.current.has(unified.id)) {
+          notifiedOrderIdsRef.current.add(unified.id);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(
+              NOTIFIED_ORDERS_KEY,
+              JSON.stringify(Array.from(notifiedOrderIdsRef.current).slice(-500))
+            );
+          }
+          triggerOrderAlert(unified);
+        }
+        void loadAllData(false);
+      })
+      .subscribe();
+
+    return () => {
+      clearInterval(timer);
+      void supabase.removeChannel(channel);
+    };
+  }, [authenticated, deliveryZones, loadAllData, supabase, triggerOrderAlert]);
 
   // إضافة / تعديل / حذف أسعار التوصيل للمناطق
   const handleAddDeliveryZone = async (e: FormEvent) => {
@@ -1935,7 +2023,7 @@ export default function WadiAdminEnterpriseDashboard() {
 
           <button
             type="button"
-            onClick={() => playNotificationTone(soundStyle)}
+            onClick={() => playNotificationTone(soundStyle, 2)}
             style={{
               padding: '8px 10px',
               borderRadius: 8,
@@ -1978,9 +2066,29 @@ export default function WadiAdminEnterpriseDashboard() {
               border: '1px solid #10b981',
               marginBottom: 16,
               fontSize: 14,
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: 10,
             }}
           >
-            {notice}
+            <span>{notice}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              aria-label="إغلاق الإشعار"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#34d399',
+                fontWeight: 700,
+                fontSize: 15,
+                cursor: 'pointer',
+                padding: '0 4px',
+              }}
+            >
+              ✕
+            </button>
           </div>
         )}
 
@@ -1993,9 +2101,29 @@ export default function WadiAdminEnterpriseDashboard() {
               border: '1px solid #ef4444',
               marginBottom: 16,
               fontSize: 14,
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: 10,
             }}
           >
-            {errorMsg}
+            <span>{errorMsg}</span>
+            <button
+              type="button"
+              onClick={() => setErrorMsg(null)}
+              aria-label="إغلاق التنبيه"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#f87171',
+                fontWeight: 700,
+                fontSize: 15,
+                cursor: 'pointer',
+                padding: '0 4px',
+              }}
+            >
+              ✕
+            </button>
           </div>
         )}
 
@@ -3059,7 +3187,7 @@ export default function WadiAdminEnterpriseDashboard() {
                       onClick={() => {
                         setSoundStyle(tone.id);
                         saveSettings({ soundStyle: tone.id });
-                        playNotificationTone(tone.id);
+                        playNotificationTone(tone.id, 2);
                       }}
                       style={{
                         padding: '9px 14px',
