@@ -31,6 +31,13 @@ export interface DeliveryZonePrice {
   active: boolean;
 }
 
+export interface ZoneRoutePrice {
+  id: string;
+  fromZone: string;
+  toZone: string;
+  priceIqd: number;
+}
+
 export interface UnifiedProfile {
   id: string;
   sourceTable: 'partners' | 'profiles';
@@ -81,6 +88,7 @@ const SETTLEMENT_KEY = 'wadi_driver_settlement_v1';
 const SUB_ADMINS_KEY = 'wadi_sub_admins_v1';
 const SETTINGS_KEY = 'wadi_admin_settings_v1';
 const ZONES_STORAGE_KEY = 'wadi_delivery_zones_v1';
+const ROUTES_STORAGE_KEY = 'wadi_zone_routes_v1';
 const NOTIFIED_ORDERS_KEY = 'wadi_notified_order_ids_v1';
 
 const COLUMN_ALIASES = {
@@ -423,13 +431,21 @@ export default function WadiAdminEnterpriseDashboard() {
   const [partners, setPartners] = useState<UnifiedProfile[]>([]);
   const [selectedDriverByOrder, setSelectedDriverByOrder] = useState<Record<string, string>>({});
 
-  // أسعار التوصيل حسب المنطقة
+  // أسعار التوصيل حسب المنطقة وأسعار المسارات (من منطقة الشريك -> إلى منطقة الزبون)
   const [deliveryZones, setDeliveryZones] = useState<DeliveryZonePrice[]>([]);
   const [newZoneName, setNewZoneName] = useState('');
   const [newZonePrice, setNewZonePrice] = useState('');
   const [editingZoneId, setEditingZoneId] = useState<string | null>(null);
   const [editingZonePriceValue, setEditingZonePriceValue] = useState('');
   const [zoneSearch, setZoneSearch] = useState('');
+
+  const [zoneRoutes, setZoneRoutes] = useState<ZoneRoutePrice[]>([]);
+  const [fromZoneInput, setFromZoneInput] = useState('');
+  const [toZoneInput, setToZoneInput] = useState('');
+  const [routePriceInput, setRoutePriceInput] = useState('');
+  const [addReverseRoute, setAddReverseRoute] = useState(true);
+  const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
+  const [editingRoutePriceValue, setEditingRoutePriceValue] = useState('');
 
   // البحث والفلترة
   const [searchQuery, setSearchQuery] = useState('');
@@ -460,7 +476,7 @@ export default function WadiAdminEnterpriseDashboard() {
     return () => clearTimeout(timer);
   }, [notice]);
 
-  // تحميل الإعدادات والمدراء وأسعار المناطق المحلية
+  // تحميل الإعدادات والمدراء وأسعار المناطق والمسارات المحلية
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
@@ -472,6 +488,9 @@ export default function WadiAdminEnterpriseDashboard() {
 
       const savedZones = localStorage.getItem(ZONES_STORAGE_KEY);
       if (savedZones) setDeliveryZones(JSON.parse(savedZones));
+
+      const savedRoutes = localStorage.getItem(ROUTES_STORAGE_KEY);
+      if (savedRoutes) setZoneRoutes(JSON.parse(savedRoutes));
 
       const savedNotified = localStorage.getItem(NOTIFIED_ORDERS_KEY);
       if (savedNotified) {
@@ -498,6 +517,13 @@ export default function WadiAdminEnterpriseDashboard() {
     setDeliveryZones(zones);
     if (typeof window !== 'undefined') {
       localStorage.setItem(ZONES_STORAGE_KEY, JSON.stringify(zones));
+    }
+  }, []);
+
+  const persistLocalRoutes = useCallback((routes: ZoneRoutePrice[]) => {
+    setZoneRoutes(routes);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
     }
   }, []);
 
@@ -541,11 +567,12 @@ export default function WadiAdminEnterpriseDashboard() {
       setErrorMsg(null);
 
       try {
-        const [ordersRes, profilesRes, partnersRes, zonesRes] = await Promise.allSettled([
+        const [ordersRes, profilesRes, partnersRes, zonesRes, routesRes] = await Promise.allSettled([
           supabase.from('orders').select('*').limit(250),
           supabase.from('profiles').select('*').limit(400),
           supabase.from('partners').select('*').limit(400),
           supabase.from('delivery_zones').select('*').limit(300),
+          supabase.from('zone_routes').select('*').order('created_at', { ascending: false }).limit(500),
         ]);
 
         let activeZones: DeliveryZonePrice[] = deliveryZones;
@@ -560,6 +587,16 @@ export default function WadiAdminEnterpriseDashboard() {
             activeZones = remoteZones;
             persistLocalZones(remoteZones);
           }
+        }
+
+        if (routesRes.status === 'fulfilled' && !routesRes.value.error && Array.isArray(routesRes.value.data)) {
+          const remoteRoutes: ZoneRoutePrice[] = (routesRes.value.data as RawRow[]).map((row, idx) => ({
+            id: readFirstString(row, ['id'], `route-${idx}`),
+            fromZone: readFirstString(row, ['from_zone'], ''),
+            toZone: readFirstString(row, ['to_zone'], ''),
+            priceIqd: readFirstNumber(row, ['price'], 0),
+          }));
+          persistLocalRoutes(remoteRoutes);
         }
 
         if (ordersRes.status === 'fulfilled' && !ordersRes.value.error && Array.isArray(ordersRes.value.data)) {
@@ -644,7 +681,7 @@ export default function WadiAdminEnterpriseDashboard() {
         setLoading(false);
       }
     },
-    [deliveryZones, persistLocalZones, soundEnabled, soundStyle, supabase, visualBannerAlerts]
+    [deliveryZones, persistLocalRoutes, persistLocalZones, soundEnabled, soundStyle, supabase, visualBannerAlerts]
   );
 
   useEffect(() => {
@@ -711,6 +748,124 @@ export default function WadiAdminEnterpriseDashboard() {
       void supabase.removeChannel(channel);
     };
   }, [authenticated, deliveryZones, loadAllData, supabase, triggerOrderAlert]);
+
+  // إضافة / تعديل / حذف أسعار المسارات (من منطقة الشريك -> إلى منطقة الزبون) في جدول zone_routes
+  const handleSaveZoneRoute = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanFrom = fromZoneInput.trim();
+    const cleanTo = toZoneInput.trim();
+    const cleanPrice = Number(routePriceInput);
+
+    if (!cleanFrom || !cleanTo || Number.isNaN(cleanPrice) || cleanPrice < 0) {
+      setErrorMsg('يرجى إدخال منطقة الشريك ومنطقة الزبون والسعر بالدينار العراقي بشكل صحيح.');
+      return;
+    }
+
+    setBusyId('save-route');
+    setNotice(null);
+    setErrorMsg(null);
+
+    try {
+      const pairs: { from_zone: string; to_zone: string }[] = [
+        { from_zone: cleanFrom, to_zone: cleanTo },
+      ];
+      if (
+        addReverseRoute &&
+        cleanFrom.toLowerCase() !== cleanTo.toLowerCase()
+      ) {
+        pairs.push({ from_zone: cleanTo, to_zone: cleanFrom });
+      }
+
+      const nextRoutes = [...zoneRoutes];
+
+      for (const pair of pairs) {
+        const existingIdx = nextRoutes.findIndex(
+          (r) =>
+            r.fromZone.trim().toLowerCase() === pair.from_zone.toLowerCase() &&
+            r.toZone.trim().toLowerCase() === pair.to_zone.toLowerCase()
+        );
+
+        if (existingIdx >= 0) {
+          const targetId = nextRoutes[existingIdx].id;
+          await supabase
+            .from('zone_routes')
+            .update({ price: cleanPrice })
+            .eq('id', targetId);
+          nextRoutes[existingIdx] = {
+            ...nextRoutes[existingIdx],
+            fromZone: pair.from_zone,
+            toZone: pair.to_zone,
+            priceIqd: cleanPrice,
+          };
+        } else {
+          const insertRes = await supabase
+            .from('zone_routes')
+            .insert([{ from_zone: pair.from_zone, to_zone: pair.to_zone, price: cleanPrice }])
+            .select();
+
+          let insertedId = `route-${Date.now()}-${pair.from_zone}`;
+          if (!insertRes.error && Array.isArray(insertRes.data) && insertRes.data.length > 0) {
+            insertedId = readFirstString(insertRes.data[0] as RawRow, ['id'], insertedId);
+          }
+
+          nextRoutes.unshift({
+            id: insertedId,
+            fromZone: pair.from_zone,
+            toZone: pair.to_zone,
+            priceIqd: cleanPrice,
+          });
+        }
+      }
+
+      persistLocalRoutes(nextRoutes);
+      setToZoneInput('');
+      setRoutePriceInput('');
+      setNotice(
+        addReverseRoute && cleanFrom.toLowerCase() !== cleanTo.toLowerCase()
+          ? `تم حفظ تسعيرة المسار (${cleanFrom} ⇄ ${cleanTo}) بقيمة ${formatIQD(cleanPrice)}.`
+          : `تم حفظ تسعيرة المسار (${cleanFrom} ← ${cleanTo}) بقيمة ${formatIQD(cleanPrice)}.`
+      );
+    } catch {
+      setErrorMsg('تعذر حفظ تسعيرة المسار في قاعدة البيانات.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleUpdateRoutePrice = async (route: ZoneRoutePrice) => {
+    const parsedPrice = Number(editingRoutePriceValue);
+    if (Number.isNaN(parsedPrice) || parsedPrice < 0) {
+      setErrorMsg('يرجى إدخال سعر صحيح.');
+      return;
+    }
+
+    setBusyId(route.id);
+    setNotice(null);
+    setErrorMsg(null);
+
+    await supabase
+      .from('zone_routes')
+      .update({ price: parsedPrice })
+      .eq('id', route.id);
+
+    const updated = zoneRoutes.map((r) =>
+      r.id === route.id ? { ...r, priceIqd: parsedPrice } : r
+    );
+    persistLocalRoutes(updated);
+    setEditingRouteId(null);
+    setEditingRoutePriceValue('');
+    setNotice(`تم تحديث سعر المسار (${route.fromZone} ← ${route.toZone}) إلى ${formatIQD(parsedPrice)}.`);
+    setBusyId(null);
+  };
+
+  const handleDeleteRoute = async (route: ZoneRoutePrice) => {
+    setBusyId(route.id);
+    await supabase.from('zone_routes').delete().eq('id', route.id);
+    const updated = zoneRoutes.filter((r) => r.id !== route.id);
+    persistLocalRoutes(updated);
+    setNotice(`تم حذف المسار (${route.fromZone} ← ${route.toZone}).`);
+    setBusyId(null);
+  };
 
   // إضافة / تعديل / حذف أسعار التوصيل للمناطق
   const handleAddDeliveryZone = async (e: FormEvent) => {
@@ -1189,6 +1344,23 @@ export default function WadiAdminEnterpriseDashboard() {
     setNotice('تم حذف حساب المدير.');
   };
 
+  const knownAreaSuggestions = useMemo(() => {
+    const set = new Set<string>();
+    deliveryZones.forEach((z) => {
+      if (z.areaName.trim()) set.add(z.areaName.trim());
+    });
+    zoneRoutes.forEach((r) => {
+      if (r.fromZone.trim()) set.add(r.fromZone.trim());
+      if (r.toZone.trim()) set.add(r.toZone.trim());
+    });
+    partners.forEach((p) => {
+      if (p.address && p.address.trim() && p.address !== 'غير محدد') {
+        set.add(p.address.trim());
+      }
+    });
+    return Array.from(set);
+  }, [deliveryZones, zoneRoutes, partners]);
+
   const partnerGroups = useMemo(() => {
     return {
       restaurants: partners.filter((p) => p.partnerCategory === 'restaurants'),
@@ -1268,6 +1440,14 @@ export default function WadiAdminEnterpriseDashboard() {
     if (!q) return deliveryZones;
     return deliveryZones.filter((z) => z.areaName.toLowerCase().includes(q));
   }, [deliveryZones, zoneSearch]);
+
+  const filteredRoutes = useMemo(() => {
+    const q = zoneSearch.trim().toLowerCase();
+    if (!q) return zoneRoutes;
+    return zoneRoutes.filter(
+      (r) => r.fromZone.toLowerCase().includes(q) || r.toZone.toLowerCase().includes(q)
+    );
+  }, [zoneRoutes, zoneSearch]);
 
   const growthStats = useMemo(() => {
     const now = Date.now();
@@ -1798,7 +1978,7 @@ export default function WadiAdminEnterpriseDashboard() {
   const navItems: { id: NavTab; label: string; count?: number; badgeColor?: string }[] = [
     { id: 'orders', label: 'الطلبات والتوجيه', count: orders.length },
     { id: 'partners_km', label: 'الشركاء وتسعير الكيلومتر', count: partners.length },
-    { id: 'delivery_prices', label: 'أسعار التوصيل والمناطق', count: deliveryZones.length },
+    { id: 'delivery_prices', label: 'أسعار التوصيل والمناطق', count: zoneRoutes.length + deliveryZones.length },
     {
       id: 'approvals',
       label: 'قبول إنشاء الحسابات',
@@ -2006,19 +2186,19 @@ export default function WadiAdminEnterpriseDashboard() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button
             type="button"
-            onClick={() => setActiveTab('partners_km')}
+            onClick={() => setActiveTab('delivery_prices')}
             style={{
               padding: '8px 10px',
               borderRadius: 8,
-              border: '1px solid #FF8A00',
-              background: 'rgba(255, 138, 0, 0.14)',
-              color: '#FF9E2C',
+              border: '1px solid #10b981',
+              background: 'rgba(16, 185, 129, 0.14)',
+              color: '#34d399',
               cursor: 'pointer',
               fontSize: 12,
               fontWeight: 700,
             }}
           >
-            الشركاء والكيلومتر
+            تسعير المسارات ({zoneRoutes.length})
           </button>
 
           <button
@@ -2159,9 +2339,9 @@ export default function WadiAdminEnterpriseDashboard() {
                 <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{drivers.length}</div>
               </div>
               <div style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 12, padding: 14 }}>
-                <div style={{ color: palette.muted, fontSize: 12 }}>المناطق المسعّرة</div>
+                <div style={{ color: palette.muted, fontSize: 12 }}>المسارات المسعّرة</div>
                 <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4, color: '#38bdf8' }}>
-                  {deliveryZones.length}
+                  {zoneRoutes.length}
                 </div>
               </div>
             </div>
@@ -2329,13 +2509,269 @@ export default function WadiAdminEnterpriseDashboard() {
           </section>
         )}
 
-        {/* 2. قسم أسعار التوصيل والمناطق */}
+        {/* 2. قسم أسعار التوصيل والمسارات (من منطقة الشريك -> إلى منطقة الزبون) */}
         {activeTab === 'delivery_prices' && (
-          <section style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <section style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <div style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 14, padding: 16 }}>
-              <h2 style={{ margin: 0, fontSize: 18 }}>إدارة أسعار التوصيل حسب المنطقة ({deliveryZones.length})</h2>
+              <h2 style={{ margin: 0, fontSize: 18 }}>
+                تسعير المسارات (من منطقة الشريك ← إلى منطقة الزبون) ({zoneRoutes.length})
+              </h2>
               <p style={{ margin: '6px 0 0', color: palette.muted, fontSize: 13 }}>
-                أضف اسم كل منطقة وسعر توصيلها بالدينار العراقي؛ وبمجرد أن يدخل الشريك اسم منطقة الزبون في تطبيقه يظهر له هذا السعر تلقائياً، ويمكنك تعديله في أي وقت.
+                أدخل منطقة الشريك ومنطقة الزبون والسعر الذي تحدده أنت؛ وعندما يختار الشريك منطقة الزبون في تطبيقه يُحسب السعر تلقائياً حسب منطقته ومنطقة الزبون.
+              </p>
+            </div>
+
+            <datalist id="wadi-admin-areas-datalist">
+              {knownAreaSuggestions.map((area) => (
+                <option key={area} value={area} />
+              ))}
+            </datalist>
+
+            <form
+              onSubmit={handleSaveZoneRoute}
+              style={{
+                background: palette.card,
+                border: '1px solid #10b981',
+                borderRadius: 14,
+                padding: 16,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 12,
+              }}
+            >
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 10 }}>
+                <input
+                  type="text"
+                  required
+                  list="wadi-admin-areas-datalist"
+                  placeholder="من منطقة الشريك (مثلاً: التاميم)"
+                  value={fromZoneInput}
+                  onChange={(e) => setFromZoneInput(e.target.value)}
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: `1px solid ${palette.border}`,
+                    background: palette.inputBg,
+                    color: palette.text,
+                    fontSize: 13,
+                  }}
+                />
+
+                <input
+                  type="text"
+                  required
+                  list="wadi-admin-areas-datalist"
+                  placeholder="إلى منطقة الزبون (مثلاً: الرمادي المركز)"
+                  value={toZoneInput}
+                  onChange={(e) => setToZoneInput(e.target.value)}
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: `1px solid ${palette.border}`,
+                    background: palette.inputBg,
+                    color: palette.text,
+                    fontSize: 13,
+                  }}
+                />
+
+                <input
+                  type="number"
+                  required
+                  min={0}
+                  step={250}
+                  placeholder="سعر التوصيل (د.ع)"
+                  value={routePriceInput}
+                  onChange={(e) => setRoutePriceInput(e.target.value)}
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: `1px solid ${palette.border}`,
+                    background: palette.inputBg,
+                    color: palette.text,
+                    fontSize: 13,
+                  }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={addReverseRoute}
+                    onChange={(e) => setAddReverseRoute(e.target.checked)}
+                  />
+                  إضافة نفس السعر للمسار العكسي تلقائياً (منطقة الزبون ← منطقة الشريك)
+                </label>
+
+                <button
+                  type="submit"
+                  disabled={busyId === 'save-route'}
+                  style={{
+                    padding: '10px 18px',
+                    borderRadius: 8,
+                    border: 'none',
+                    background: '#15803d',
+                    color: '#fff',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    fontSize: 13,
+                  }}
+                >
+                  + حفظ تسعيرة المسار
+                </button>
+              </div>
+            </form>
+
+            {(zoneRoutes.length > 0 || deliveryZones.length > 0) && (
+              <input
+                type="text"
+                value={zoneSearch}
+                onChange={(e) => setZoneSearch(e.target.value)}
+                placeholder="بحث سريع عن منطقة أو مسار..."
+                style={{
+                  padding: '9px 12px',
+                  borderRadius: 8,
+                  border: `1px solid ${palette.border}`,
+                  background: palette.inputBg,
+                  color: palette.text,
+                  fontSize: 13,
+                }}
+              />
+            )}
+
+            {filteredRoutes.length === 0 ? (
+              <div style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 12, padding: 18, color: palette.muted }}>
+                لم تقم بإضافة أسعار مسارات (من منطقة الشريك إلى منطقة الزبون) بعد. أضف أول مسار من النموذج أعلاه.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 12 }}>
+                {filteredRoutes.map((route) => {
+                  const isEditing = editingRouteId === route.id;
+                  return (
+                    <div
+                      key={route.id}
+                      style={{
+                        background: palette.card,
+                        border: `1px solid ${palette.border}`,
+                        borderRadius: 12,
+                        padding: 14,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 10,
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                        <strong style={{ fontSize: 14 }}>
+                          {route.fromZone} ← {route.toZone}
+                        </strong>
+                        <span style={{ color: '#34d399', fontWeight: 700, fontSize: 15 }}>
+                          {formatIQD(route.priceIqd)}
+                        </span>
+                      </div>
+
+                      {isEditing ? (
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <input
+                            type="number"
+                            min={0}
+                            step={250}
+                            value={editingRoutePriceValue}
+                            onChange={(e) => setEditingRoutePriceValue(e.target.value)}
+                            style={{
+                              flex: 1,
+                              padding: 8,
+                              borderRadius: 8,
+                              border: '1px solid #38bdf8',
+                              background: palette.inputBg,
+                              color: palette.text,
+                              fontSize: 13,
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={busyId === route.id}
+                            onClick={() => void handleUpdateRoutePrice(route)}
+                            style={{
+                              padding: '8px 12px',
+                              borderRadius: 8,
+                              border: 'none',
+                              background: '#2563eb',
+                              color: '#fff',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              fontSize: 12,
+                            }}
+                          >
+                            حفظ
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingRouteId(null)}
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: 8,
+                              border: `1px solid ${palette.border}`,
+                              background: 'transparent',
+                              color: palette.muted,
+                              cursor: 'pointer',
+                              fontSize: 12,
+                            }}
+                          >
+                            إلغاء
+                          </button>
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingRouteId(route.id);
+                              setEditingRoutePriceValue(String(route.priceIqd));
+                            }}
+                            style={{
+                              padding: '7px 12px',
+                              borderRadius: 8,
+                              border: '1px solid #38bdf8',
+                              background: 'transparent',
+                              color: '#38bdf8',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              fontSize: 12,
+                            }}
+                          >
+                            تعديل السعر
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={busyId === route.id}
+                            onClick={() => void handleDeleteRoute(route)}
+                            style={{
+                              padding: '7px 12px',
+                              borderRadius: 8,
+                              border: '1px solid #ef4444',
+                              background: 'transparent',
+                              color: '#ef4444',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              fontSize: 12,
+                            }}
+                          >
+                            حذف
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* أسعار المناطق الافتراضية (احتياطية إذا لم يُضف مسار محدد) */}
+            <div style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 14, padding: 16, marginTop: 6 }}>
+              <h3 style={{ margin: '0 0 6px', fontSize: 16 }}>أسعار المناطق الاحتياطية ({deliveryZones.length})</h3>
+              <p style={{ margin: 0, color: palette.muted, fontSize: 12 }}>
+                تُستخدم كسعر احتياطي في حال لم يتم تسجيل سعر خاص لمسار (منطقة الشريك ← منطقة الزبون).
               </p>
             </div>
 
@@ -2397,39 +2833,18 @@ export default function WadiAdminEnterpriseDashboard() {
                   padding: '10px 16px',
                   borderRadius: 8,
                   border: 'none',
-                  background: '#15803d',
+                  background: '#2563eb',
                   color: '#fff',
                   fontWeight: 700,
                   cursor: 'pointer',
                   fontSize: 13,
                 }}
               >
-                + إضافة منطقة وسعر
+                + إضافة منطقة احتياطية
               </button>
             </form>
 
-            {deliveryZones.length > 0 && (
-              <input
-                type="text"
-                value={zoneSearch}
-                onChange={(e) => setZoneSearch(e.target.value)}
-                placeholder="بحث سريع عن منطقة..."
-                style={{
-                  padding: '9px 12px',
-                  borderRadius: 8,
-                  border: `1px solid ${palette.border}`,
-                  background: palette.inputBg,
-                  color: palette.text,
-                  fontSize: 13,
-                }}
-              />
-            )}
-
-            {filteredZones.length === 0 ? (
-              <div style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 12, padding: 20, color: palette.muted }}>
-                لم تقم بإضافة مناطق وأسعار توصيل بعد. أضف أول منطقة من النموذج أعلاه.
-              </div>
-            ) : (
+            {filteredZones.length > 0 && (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
                 {filteredZones.map((zone) => {
                   const isEditing = editingZoneId === zone.id;
