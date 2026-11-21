@@ -2,12 +2,14 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase';
+import WadiPricingAndPartnersAdmin from '@/WadiPricingAndPartnersAdmin';
 
 type RawRow = Record<string, unknown>;
 
 type NavTab =
   | 'orders'
   | 'delivery_prices'
+  | 'partners_km'
   | 'approvals'
   | 'restaurants'
   | 'stores'
@@ -238,7 +240,10 @@ function unifyOrder(row: RawRow, index = 0, zones: DeliveryZonePrice[] = []): Un
   if (deliveryFee <= 0 && area && zones.length > 0) {
     const cleanArea = area.trim().toLowerCase();
     const matchedZone = zones.find(
-      (z) => z.active && (cleanArea.includes(z.areaName.trim().toLowerCase()) || z.areaName.trim().toLowerCase().includes(cleanArea))
+      (z) =>
+        z.active &&
+        (cleanArea.includes(z.areaName.trim().toLowerCase()) ||
+          z.areaName.trim().toLowerCase().includes(cleanArea))
     );
     if (matchedZone) {
       deliveryFee = matchedZone.priceIqd;
@@ -281,7 +286,8 @@ function playNotificationTone(style: SoundStyle) {
   if (typeof window === 'undefined') return;
   try {
     const AudioCtx =
-      window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
 
     const ctx = new AudioCtx();
@@ -1615,6 +1621,7 @@ export default function WadiAdminEnterpriseDashboard() {
 
   const navItems: { id: NavTab; label: string; count?: number; badgeColor?: string }[] = [
     { id: 'orders', label: 'الطلبات والتوجيه', count: orders.length },
+    { id: 'partners_km', label: 'الشركاء وتسعير الكيلومتر', count: partners.length },
     { id: 'delivery_prices', label: 'أسعار التوصيل والمناطق', count: deliveryZones.length },
     {
       id: 'approvals',
@@ -1823,6 +1830,23 @@ export default function WadiAdminEnterpriseDashboard() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button
             type="button"
+            onClick={() => setActiveTab('partners_km')}
+            style={{
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: '1px solid #FF8A00',
+              background: 'rgba(255, 138, 0, 0.14)',
+              color: '#FF9E2C',
+              cursor: 'pointer',
+              fontSize: 12,
+              fontWeight: 700,
+            }}
+          >
+            الشركاء والكيلومتر
+          </button>
+
+          <button
+            type="button"
             onClick={() => playNotificationTone(soundStyle)}
             style={{
               padding: '8px 10px',
@@ -1885,6 +1909,13 @@ export default function WadiAdminEnterpriseDashboard() {
           >
             {errorMsg}
           </div>
+        )}
+
+        {/* قسم إدارة الشركاء وأسعار الكيلومتر والمناطق المباشرة */}
+        {activeTab === 'partners_km' && (
+          <section style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <WadiPricingAndPartnersAdmin />
+          </section>
         )}
 
         {/* 1. قسم الطلبات والتوجيه */}
